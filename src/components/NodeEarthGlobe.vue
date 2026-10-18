@@ -15,6 +15,7 @@ import { useAppStore } from '@/stores/app'
 import { useNodesStore } from '@/stores/nodes'
 import { getApiAssetUrl } from '@/utils/api'
 import { getCoordByCode, getCountryCodeFromRegion } from '@/utils/geoHelper'
+import { placeGlobeLabels, sameGlobeLocation } from '@/utils/globeLabels'
 import { formatBytesPerSecondSplit } from '@/utils/helper'
 
 const props = defineProps<{
@@ -162,6 +163,7 @@ const userCoord = computed<[number, number] | null>(() => {
 
 const clusterOverlayEls = new Map<string, HTMLDivElement>()
 const clusterOverlayRefBinders = new Map<string, (el: Element | ComponentPublicInstance | null) => void>()
+const clusterLeaderEls = new Map<string, SVGLineElement>()
 
 function coordToGlobePoint([lat, lon]: [number, number]): [number, number, number] {
   const latRad = lat * Math.PI / 180
@@ -182,12 +184,10 @@ function getRenderSize() {
 
 // iOS Safari 对 cobe 内部 marker anchor 的 DOM/style 行为不稳定，
 // overlay 改为组件内自行投影定位，避免回落到容器左上角。
-function syncClusterOverlayPosition(cluster: RegionCluster, el: HTMLDivElement) {
+function projectCluster(cluster: RegionCluster) {
   const { width, height } = getRenderSize()
   if (width <= 0 || height <= 0) {
-    el.style.opacity = '0'
-    el.style.filter = 'blur(20px)'
-    return
+    return { x: 0, y: 0, visible: false }
   }
 
   const aspect = width / height
@@ -210,33 +210,52 @@ function syncClusterOverlayPosition(cluster: RegionCluster, el: HTMLDivElement) 
   const xPx = ((screenX / aspect) * GLOBE_SCALE + 1) * width / 2
   const yPx = ((-screenY) * GLOBE_SCALE + 1) * height / 2
 
-  el.style.transform = `translate3d(${xPx}px, ${yPx}px, 0)`
-  el.style.opacity = visible ? '1' : '0'
-  el.style.filter = visible ? 'blur(0px)' : 'blur(20px)'
+  return { x: xPx, y: yPx, visible }
 }
 
 function syncClusterOverlayPositions() {
+  const { width, height } = getRenderSize()
+  const anchors = regionClusters.value.map(cluster => ({ key: cluster.code, ...projectCluster(cluster) }))
+  const labels = placeGlobeLabels(anchors.filter(anchor => anchor.visible).map(anchor => ({
+    ...anchor,
+    width: clusterOverlayEls.get(anchor.key)?.offsetWidth ?? 0,
+    height: clusterOverlayEls.get(anchor.key)?.offsetHeight ?? 0,
+  })), width, height)
+  const positions = new Map(labels.map(label => [label.key, label]))
   for (const cluster of regionClusters.value) {
     const el = clusterOverlayEls.get(cluster.code)
     if (!el)
       continue
-    syncClusterOverlayPosition(cluster, el)
+    const position = positions.get(cluster.code)
+    el.style.opacity = position ? '1' : '0'
+    el.style.visibility = position ? 'visible' : 'hidden'
+    const leader = clusterLeaderEls.get(cluster.code)
+    if (leader)
+      leader.style.opacity = position ? '1' : '0'
+    if (!position)
+      continue
+    el.style.transform = `translate3d(${position.left}px, ${position.top}px, 0)`
+    if (leader) {
+      leader.setAttribute('x1', `${position.x}`)
+      leader.setAttribute('y1', `${position.y}`)
+      leader.setAttribute('x2', `${Math.max(position.left, Math.min(position.x, position.left + position.width))}`)
+      leader.setAttribute('y2', `${Math.max(position.top, Math.min(position.y, position.top + position.height))}`)
+    }
   }
+}
+
+function setClusterLeaderEl(code: string, el: Element | ComponentPublicInstance | null) {
+  if (el instanceof SVGLineElement)
+    clusterLeaderEls.set(code, el)
+  else
+    clusterLeaderEls.delete(code)
 }
 
 function setClusterOverlayEl(code: string, el: Element | ComponentPublicInstance | null) {
   if (el instanceof HTMLDivElement) {
-    el.style.willChange = 'transform, opacity, filter'
+    el.style.willChange = 'transform, opacity'
     clusterOverlayEls.set(code, el)
-
-    const cluster = regionClusters.value.find(item => item.code === code)
-    if (cluster) {
-      syncClusterOverlayPosition(cluster, el)
-    }
-    else {
-      el.style.opacity = '0'
-      el.style.filter = 'blur(20px)'
-    }
+    syncClusterOverlayPositions()
     return
   }
 
@@ -254,10 +273,14 @@ function bindClusterOverlayRef(code: string): (el: Element | ComponentPublicInst
 }
 
 const markers = computed<Marker[]>(() => {
-  return regionClusters.value.map(cluster => ({
+  const points: Marker[] = regionClusters.value.map(cluster => ({
     location: cluster.coord,
-    size: 0, // 不渲染圆点
+    size: 0.015,
   }))
+  const user = userCoord.value
+  if (user && !regionClusters.value.some(cluster => sameGlobeLocation(cluster.coord, user)))
+    points.push({ location: user, size: 0.02 })
+  return points
 })
 
 // 从各地区汇聚到用户当前位置；无用户坐标时回退到 hub 拓扑
@@ -266,7 +289,7 @@ const arcs = computed<Arc[]>(() => {
   const user = userCoord.value
   if (!arcsEnabled.value || !user || clusters.length === 0)
     return []
-  return clusters.map(cluster => ({
+  return clusters.filter(cluster => !sameGlobeLocation(cluster.coord, user)).map(cluster => ({
     from: cluster.coord,
     to: user,
   }))
@@ -313,7 +336,7 @@ function buildInitialOptions(): COBEOptions {
     arcs: arcs.value,
     arcColor: colors.arcColor,
     arcWidth: 0.8,
-    arcHeight: 0.4,
+    arcHeight: 0.25,
     markerElevation: MARKER_ELEVATION,
   }
 }
@@ -448,6 +471,11 @@ watch(
   },
 )
 
+watch(regionRates, async () => {
+  await nextTick()
+  syncClusterOverlayPositions()
+})
+
 watch(shouldRender, () => {
   if (!globe)
     return
@@ -495,28 +523,37 @@ function formatRate(bytesPerSec: number): string {
 </script>
 
 <template>
-  <div ref="containerRef" class="relative aspect-square w-full max-w-md mx-auto -translate-y-6 md:-translate-y-12">
+  <div ref="containerRef" data-testid="earth-globe" class="relative aspect-square w-full max-w-md mx-auto -translate-y-6 md:-translate-y-12">
     <canvas
       ref="canvasRef"
       class="earth-globe-canvas absolute inset-0 w-full h-full select-none touch-none cursor-grab active:cursor-grabbing"
       @pointerdown="onPointerDown" @pointermove="onPointerMove" @pointerup="onPointerUp" @pointercancel="onPointerUp"
     />
 
+    <svg class="absolute inset-0 h-full w-full pointer-events-none text-blue-500/65" aria-hidden="true">
+      <line
+        v-for="cluster in regionClusters" :key="cluster.code"
+        :ref="el => setClusterLeaderEl(cluster.code, el)"
+        stroke="currentColor" stroke-width="1" vector-effect="non-scaling-stroke"
+      />
+    </svg>
+
     <template v-for="cluster in regionClusters" :key="cluster.code">
       <div
         :ref="bindClusterOverlayRef(cluster.code)"
-        class="absolute -top-7.5 left-0 pointer-events-none rounded backdrop-blur transition-[opacity,filter] duration-500"
+        :data-globe-label="cluster.code"
+        class="absolute top-0 left-0 pointer-events-none flex w-24 items-center gap-1 rounded bg-background/90 px-1.5 py-1 text-[10px] leading-3 shadow-sm"
       >
         <img
           :src="getApiAssetUrl(`flags/${cluster.code.toLowerCase()}.svg`)" :alt="cluster.code"
-          class="size-4 block absolute -bottom-2 -left-2 z-1 drop-shadow-[0_0_2px_rgba(0,0,0,0.1)]"
+          class="w-4 h-3 shrink-0 object-contain"
         >
-        <div class="relative z-2 bg-background/60 rounded py-0.5 px-1 text-xs zoom-80 items-start justify-center text-nowrap">
+        <div class="min-w-0 tabular-nums text-nowrap">
           <div class="text-green-600 flex flex-row items-center gap-0.5">
-            <Icon icon="tabler:chevron-up" width="12" height="12" /> {{ formatRate(rateFor(cluster.code).up) }}
+            <Icon icon="tabler:chevron-up" class="shrink-0" width="10" height="10" /> {{ formatRate(rateFor(cluster.code).up) }}
           </div>
           <div class="text-blue-600 flex flex-row items-center gap-0.5">
-            <Icon icon="tabler:chevron-down" width="12" height="12" /> {{ formatRate(rateFor(cluster.code).down) }}
+            <Icon icon="tabler:chevron-down" class="shrink-0" width="10" height="10" /> {{ formatRate(rateFor(cluster.code).down) }}
           </div>
         </div>
       </div>
