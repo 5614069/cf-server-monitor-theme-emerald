@@ -48,6 +48,13 @@ export interface NodeStatusPing {
   loss: number
   min: number
   max: number
+  latencyAvailable?: boolean
+  lossAvailable?: boolean
+}
+
+export interface NetworkQuality {
+  latency: number | null
+  loss: number | null
 }
 
 /** 一小时延迟窗口中的单个 2 分钟桶（已按 ct/cu/cm/bd 聚合） */
@@ -55,6 +62,7 @@ export interface PingWindowPoint {
   time: string
   latency: number | null
   loss: number | null
+  networks?: Record<string, NetworkQuality>
 }
 
 export interface NodeStatus {
