@@ -967,7 +967,17 @@ function trafficLimitType(value: unknown): string {
 function pingEntry(name: string, latency: unknown, loss: unknown): NodeStatusPing {
   const latest = finiteNumber(latency)
   const lossValue = finiteNumber(loss)
-  return { name, latest, avg: latest, tail: latest, loss: lossValue, min: latest, max: latest }
+  return {
+    name,
+    latest,
+    avg: latest,
+    tail: latest,
+    loss: lossValue,
+    min: latest,
+    max: latest,
+    latencyAvailable: isPingFieldPresent(latency) && latest > 0,
+    lossAvailable: isPingFieldPresent(loss) && lossValue >= 0 && lossValue <= 100,
+  }
 }
 
 interface PingTaskDefinition {
@@ -1017,6 +1027,10 @@ function buildPingWindowPoint(
   pingPoint: LatencyWindowPoint | undefined,
   lossPoint: LatencyWindowPoint | undefined,
 ): PingWindowPoint | null {
+  const networks = Object.fromEntries(PING_WINDOW_PROVIDER_KEYS.map(key => [key, {
+    latency: pingWindowNumber(pingPoint?.[key]),
+    loss: pingWindowNumber(lossPoint?.[key]),
+  }]))
   const latencyValues = PING_WINDOW_PROVIDER_KEYS
     .map(key => pingWindowNumber(pingPoint?.[key]))
     .filter((value): value is number => value !== null && value > 0)
@@ -1035,6 +1049,7 @@ function buildPingWindowPoint(
     loss: lossValues.length
       ? lossValues.reduce((sum, value) => sum + value, 0) / lossValues.length
       : null,
+    networks,
   }
 }
 
@@ -1045,6 +1060,12 @@ function buildPingWindow(server: CfServer): PingWindowPoint[] | undefined {
   if (!ping?.length && !loss?.length)
     return undefined
 
+  const pingByTs = new Map<number, LatencyWindowPoint>()
+  for (const point of ping ?? []) {
+    const ts = timestamp(point.ts, 0)
+    if (ts > 0)
+      pingByTs.set(ts, point)
+  }
   const lossByTs = new Map<number, LatencyWindowPoint>()
   for (const point of loss ?? []) {
     const ts = timestamp(point.ts, 0)
@@ -1053,25 +1074,11 @@ function buildPingWindow(server: CfServer): PingWindowPoint[] | undefined {
   }
 
   const points: PingWindowPoint[] = []
-  for (const point of ping ?? []) {
-    const ts = timestamp(point.ts, 0)
-    if (ts <= 0)
-      continue
-    const point2 = buildPingWindowPoint(ts, point, lossByTs.get(ts))
+  const timestamps = [...new Set([...pingByTs.keys(), ...lossByTs.keys()])].sort((a, b) => a - b)
+  for (const ts of timestamps) {
+    const point2 = buildPingWindowPoint(ts, pingByTs.get(ts), lossByTs.get(ts))
     if (point2)
       points.push(point2)
-  }
-
-  // 延迟窗口为空但丢包有数据时，以丢包的 ts 生成点
-  if (!points.length) {
-    for (const point of loss ?? []) {
-      const ts = timestamp(point.ts, 0)
-      if (ts <= 0)
-        continue
-      const point2 = buildPingWindowPoint(ts, undefined, point)
-      if (point2)
-        points.push(point2)
-    }
   }
 
   return points.length ? points : undefined
