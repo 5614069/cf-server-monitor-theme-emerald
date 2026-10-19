@@ -1248,7 +1248,7 @@ export async function fetchHistory(uuid: string, hours = 1): Promise<StatusRecor
 
 export async function fetchPingHistory(uuid: string, hours = 1): Promise<{
   records: PingRecord[]
-  tasks: Array<{ id: number, key: PingTaskKey, name: string, interval: number, loss: number }>
+  tasks: Array<{ id: number, key: PingTaskKey, name: string, interval: number, loss?: number }>
 }> {
   const source = getServerSource(uuid)
   const rows = await request<HistoryRow[]>(`/api/history/all?id=${encodeURIComponent(source.serverId)}&hours=${hours}`, source.apiIndex)
@@ -1275,7 +1275,7 @@ export async function fetchPingHistory(uuid: string, hours = 1): Promise<{
         task_id: task.id,
         time,
         value: lossValue >= 100 || latency <= 0 ? -1 : latency,
-        loss: lossValue,
+        loss: hasLoss ? lossValue : undefined,
       })
       if (hasLoss) {
         const taskLosses = losses.get(task.id) ?? []
@@ -1292,7 +1292,9 @@ export async function fetchPingHistory(uuid: string, hours = 1): Promise<{
       key: task.key,
       name: pingTaskNames[task.key],
       interval: 60,
-      loss: (losses.get(task.id) ?? []).reduce((sum, value) => sum + value, 0) / Math.max(1, losses.get(task.id)?.length ?? 0),
+      loss: losses.get(task.id)?.length
+        ? losses.get(task.id)!.reduce((sum, value) => sum + value, 0) / losses.get(task.id)!.length
+        : undefined,
     })),
   }
 }
